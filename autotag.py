@@ -54,7 +54,7 @@ def enable_cloud_trail(bucket):
     return name
 
 
-def upload_template(template):
+def upload_template(bucket, template):
     client = boto3.client('s3')
 
     key = '{date}-{name}'.format(date=datetime.now().strftime('%Y%m%d'),
@@ -84,6 +84,6 @@ def cloud_formation(bucket, template):
 if __name__ == "__main__":
     bucket = create_bucket()
     cloud_trail = enable_cloud_trail(bucket)
-    template = upload_template('AutoTag.template')
+    template = upload_template(bucket, 'AutoTag.template')
     cloud_formation(bucket, template)
 
