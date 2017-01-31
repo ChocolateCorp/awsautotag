@@ -1,113 +1,90 @@
-# -*- coding: utf-8 -*-
-
-import boto3
+from __future__ import print_function
 import json
-import random
+import boto3
+import logging
+import time
+import datetime
 
-from datetime import datetime
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
+def lambda_handler(event, context):
+    ids = []
 
-CHARS = 'abcdefghijklmnopqrstuvwxyz0123456789'
-POLICY = """{{
-  "Version": "2012-10-17",
-  "Statement": [
-    {{
-      "Sid": "AWSCloudTrailAclCheck20150319",
-      "Effect": "Allow",
-      "Principal": {{"Service": "cloudtrail.amazonaws.com"}},
-      "Action": "s3:GetBucketAcl",
-      "Resource": "arn:aws:s3:::{bucket}"
-    }},
-    {{
-      "Sid": "AWSCloudTrailWrite20150319",
-      "Effect": "Allow",
-      "Principal": {{"Service": "cloudtrail.amazonaws.com"}},
-      "Action": "s3:PutObject",
-      "Resource": "arn:aws:s3:::{bucket}/AWSLogs/{account}/*",
-      "Condition": {{"StringEquals": {{"s3:x-amz-acl":
-          "bucket-owner-full-control"}}
-      }}
-    }}
-  ]
-}}"""
+    try:
+        region = event['region']
+        detail = event['detail']
+        eventname = detail['eventName']
+        arn = detail['userIdentity']['arn']
+        principal = detail['userIdentity']['principalId']
+        userType = detail['userIdentity']['type']
 
+        if userType == 'IAMUser':
+            user = detail['userIdentity']['userName']
 
-def get_random_string(length=12, allowed_chars=CHARS):
-        return ''.join(random.choice(allowed_chars) for _ in range(length))
+        else:
+            try:
+                user = principal.split(':')[1]
+            except IndexError:
+                user = principal
 
 
-def get_account_id():
-    return boto3.client('sts').get_caller_identity().get('Account')
+        logger.info('principalId: ' + str(principal))
+        logger.info('region: ' + str(region))
+        logger.info('eventName: ' + str(eventname))
+        logger.info('detail: ' + str(detail))
 
+        if not detail['responseElements']:
+            logger.warning('Not responseElements found')
+            if detail['errorCode']:
+                logger.error('errorCode: ' + detail['errorCode'])
+            if detail['errorMessage']:
+                logger.error('errorMessage: ' + detail['errorMessage'])
+            return False
 
-def create_bucket():
-    s3 = boto3.client('s3')
-    bucket = 'autotag-%s-resources' % get_random_string()
+        ec2 = boto3.resource('ec2')
 
-    response = s3.create_bucket(
-        Bucket=bucket
-    )
+        if eventname == 'CreateVolume':
+            ids.append(detail['responseElements']['volumeId'])
+            logger.info(ids)
 
-    policy = POLICY.format(bucket=bucket, account=get_account_id())
-    response = s3.put_bucket_policy(
-        Bucket=bucket,
-        Policy=json.dumps(json.loads(policy))
-    )
+        elif eventname == 'RunInstances':
+            items = detail['responseElements']['instancesSet']['items']
+            for item in items:
+                ids.append(item['instanceId'])
+            logger.info(ids)
+            logger.info('number of instances: ' + str(len(ids)))
 
-    print("S3 bucket named %s created and policy attached." % bucket)
-    return bucket
+            base = ec2.instances.filter(InstanceIds=ids)
 
+            #loop through the instances
+            for instance in base:
+                for vol in instance.volumes.all():
+                    ids.append(vol.id)
+                for eni in instance.network_interfaces:
+                    ids.append(eni.id)
 
-def enable_cloud_trail(bucket):
-    cloudtrail = boto3.client('cloudtrail')
+        elif eventname == 'CreateImage':
+            ids.append(detail['responseElements']['imageId'])
+            logger.info(ids)
 
-    name = 'AutoTagResources'
-    response = cloudtrail.create_trail(
-            Name=name,
-            S3BucketName=bucket,
-            IncludeGlobalServiceEvents=True,
-            IsMultiRegionTrail=True,
-            EnableLogFileValidation=True,
-    )
+        elif eventname == 'CreateSnapshot':
+            ids.append(detail['responseElements']['snapshotId'])
+            logger.info(ids)
+        else:
+            logger.warning('Not supported action')
 
-    response = cloudtrail.start_logging(
-            Name=name
-    )
+        if ids:
+            for resourceid in ids:
+                print('Tagging resource ' + resourceid)
+            ec2.create_tags(Resources=ids,
+                            Tags=[{'Key': 'Owner', 'Value': user},
+                                  {'Key': 'PrincipalId', 'Value': principal}])
 
-    print("Cloud trail enabled and logging.")
-    return name
-
-
-def upload_template(bucket, template):
-    client = boto3.client('s3')
-
-    key = '{date}-{name}'.format(date=datetime.now().strftime('%Y%m%d'),
-                                 name=template)
-    with open(template, 'rb') as data:
-        client.upload_fileobj(data, bucket, key)
-
-    print("Cloud formation template with name %s uploaded." % key)
-    return key
-
-
-def cloud_formation(bucket, template):
-    client = boto3.client('cloudformation')
-
-    url = 'https://s3.amazonaws.com/{bucket}/{template}'.format(bucket=bucket,
-                                                            template=template)
-    response = client.create_stack(
-        StackName='AutoTagResources',
-        TemplateURL=url,
-        DisableRollback=False,
-        Capabilities=['CAPABILITY_IAM'],
-    )
-
-    print("Successfully configured cloud auto tag env.")
-
-
-if __name__ == "__main__":
-    bucket = create_bucket()
-    cloud_trail = enable_cloud_trail(bucket)
-    template = upload_template(bucket, 'AutoTag.template')
-    cloud_formation(bucket, template)
+        logger.info(' Remaining time (ms): '
+                    + str(context.get_remaining_time_in_millis()) + '\n')
+        return True
+    except Exception as e:
+        logger.error('Something went wrong: ' + str(e))
+        return False
 
