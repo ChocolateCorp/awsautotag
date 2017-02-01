@@ -4,142 +4,128 @@ import boto3
 import json
 import random
 
+from botocore.exceptions import ClientError
 from datetime import datetime
 
 
 CHARS = 'abcdefghijklmnopqrstuvwxyz0123456789'
 
-BUCKET_POLICY = """{{
-  "Version": "2012-10-17",
-  "Statement": [
-    {{
-      "Sid": "AWSCloudTrailAclCheck20150319",
-      "Effect": "Allow",
-      "Principal": {{"Service": "cloudtrail.amazonaws.com"}},
-      "Action": "s3:GetBucketAcl",
-      "Resource": "arn:aws:s3:::{bucket}"
-    }},
-    {{
-      "Sid": "AWSCloudTrailWrite20150319",
-      "Effect": "Allow",
-      "Principal": {{"Service": "cloudtrail.amazonaws.com"}},
-      "Action": "s3:PutObject",
-      "Resource": "arn:aws:s3:::{bucket}/AWSLogs/{account}/*",
-      "Condition": {{"StringEquals": {{"s3:x-amz-acl":
-          "bucket-owner-full-control"}}
-      }}
-    }}
-  ]
-}}"""
-
-ROLE_ASSUME_POLICY = """{
-  "Version" : "2012-10-17",
-  "Statement" : [
-    {
-      "Effect" : "Allow",
-      "Principal" : {"Service" : ["lambda.amazonaws.com"]},
-      "Action" : ["sts:AssumeRole"]
-    }
-  ]
-}"""
-
-ROLE_POLICY = """{
-  "Version" : "2012-10-17",
-  "Statement" : [
-    {
-      "Sid" : "Stmt1458923097000",
-      "Effect" : "Allow",
-      "Action" : ["cloudtrail:LookupEvents"],
-      "Resource" : ["*"]
-    },
-    {
-      "Sid" : "Stmt1458923121000",
-      "Effect" : "Allow",
-      "Action" : [
-        "ec2:CreateTags",
-        "ec2:Describe*",
-        "logs:CreateLogGroup",
-        "logs:CreateLogStream",
-        "logs:PutLogEvents"
-      ],
-      "Resource" : ["*"]
-    }
-  ]
-}"""
 
 def get_random_string(length=12, allowed_chars=CHARS):
-        return ''.join(random.choice(allowed_chars) for _ in range(length))
+    """Generate random string of given length with allowed chars."""
+    return ''.join(random.choice(allowed_chars) for _ in range(length))
 
 
 def get_account_id():
+    """Retrieve principal account id."""
     return boto3.client('sts').get_caller_identity().get('Account')
 
 
-def create_bucket():
+def create_bucket(name):
+    """Create s3 bucket and attach cloudtrail policy."""
     s3 = boto3.client('s3')
-    bucket = 'autotag-%s-resources' % get_random_string()
+    bucket = '%s-%s' % (name, get_random_string())
+
+    bucketPolicy = {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Sid": "AWSCloudTrailAclCheck20150319",
+          "Effect": "Allow",
+          "Principal": {"Service": "cloudtrail.amazonaws.com"},
+          "Action": "s3:GetBucketAcl",
+          "Resource": "arn:aws:s3:::%s" % bucket
+        },
+        {
+          "Sid": "AWSCloudTrailWrite20150319",
+          "Effect": "Allow",
+          "Principal": {"Service": "cloudtrail.amazonaws.com"},
+          "Action": "s3:PutObject",
+          "Resource": "arn:aws:s3:::%s/AWSLogs/%s/*" % (bucket,
+                                                        get_account_id()),
+          "Condition": {"StringEquals": {"s3:x-amz-acl":
+              "bucket-owner-full-control"}
+          }
+        }
+      ]
+    }
 
     response = s3.create_bucket(
         Bucket=bucket
     )
 
-    policy = BUCKET_POLICY.format(bucket=bucket, account=get_account_id())
     response = s3.put_bucket_policy(
         Bucket=bucket,
-        Policy=json.dumps(json.loads(policy))
+        Policy=json.dumps(policy)
     )
 
     print("S3 bucket named %s created and policy attached." % bucket)
     return bucket
 
 
-def create_role():
+def create_role(roleName, policyName, rolePolicy):
+    """Create or retrieve role and attach inline policy."""
     iam = boto3.client('iam')
-    role_name = 'LambdaAutoTagRole'
-    policy_name = 'LambdaAutoTagResourcesPolicy'
+    policyDoc = {
+      "Version" : "2012-10-17",
+      "Statement" : [
+        {
+          "Effect" : "Allow",
+          "Principal" : {"Service" : ["lambda.amazonaws.com"]},
+          "Action" : ["sts:AssumeRole"]
+        }
+      ]
+    }
 
-    response = iam.create_role(
-        RoleName=role_name,
-        AssumeRolePolicyDocument=ROLE_ASSUME_POLICY
-    )
-    role_arn = response['Role']['Arn']
-    print('Created role %s' % role_name)
+    roles = [role['RoleName'] for role in iam.list_roles()['Roles']]
+    if roleName in roles:
+        print('Role %s exists' % roleName)
+        role = iam.get_role(
+            RoleName=roleName
+        )['Role']
+    else:
+        role = iam.create_role(
+            RoleName=roleName,
+            AssumeRolePolicyDocument=json.dumps(policyDoc)
+         )['Role']
+        print('Created role %s' % roleName)
 
-    response = iam.create_policy(
-        PolicyName=policy_name,
-        PolicyDocument=ROLE_POLICY
-    )
-    print('Created policy %s' % policy_name)
+    policies = iam.list_role_policies(RoleName=roleName)['PolicyNames']
+    if policyName not in policies:
+        iam.put_role_policy(
+            RoleName=roleName,
+            PolicyName=policyName,
+            PolicyDocument=json.dumps(rolePolicy)
+        )
+        print('Put role policy %s' % policyName)
 
-    response = iam.attach_role_policy(
-        RoleName=role_name,
-        PolicyArn=response['Policy']['Arn']
-    )
-    print('Attached role policy')
-    return role_arn
+    return role['Arn']
 
 
-def enable_cloud_trail(bucket):
+def enable_cloud_trail(bucket, name):
+    """Create and enable cloud trail if it does not exist already."""
     cloudtrail = boto3.client('cloudtrail')
 
-    name = 'AutoTagResources'
-    response = cloudtrail.create_trail(
+    try:
+        cloudtrail.create_trail(
             Name=name,
             S3BucketName=bucket,
             IncludeGlobalServiceEvents=True,
             IsMultiRegionTrail=True,
             EnableLogFileValidation=True,
-    )
+        )
 
-    response = cloudtrail.start_logging(
-            Name=name
-    )
+        cloudtrail.start_logging(Name=name)
+        print("Cloud trail enabled and logging.")
+    except ClientError as e:
+        if 'TrailAlreadyExists' in e.message:
+            print('Trail already exists')
 
-    print("Cloud trail enabled and logging.")
     return name
 
 
 def upload_file(bucket, filename):
+    """Upload file to given s3 bucket and overwrite if exists."""
     client = boto3.client('s3')
 
     with open(filename, 'rb') as data:
@@ -150,6 +136,7 @@ def upload_file(bucket, filename):
 
 
 def cloud_formation(bucket, template, function, region, role):
+    """Deploy cloud formation to given region."""
     client = boto3.client('cloudformation', region_name=region)
 
     url = 'https://s3.amazonaws.com/{bucket}/{template}'.format(bucket=bucket,
@@ -160,7 +147,7 @@ def cloud_formation(bucket, template, function, region, role):
         DisableRollback=False,
         Capabilities=['CAPABILITY_IAM'],
         Parameters=[
-            {'ParameterKey': 'LambdaRoleArn', 'ParameterValue': role},
+            {'ParameterKey': 'LambdaRoleArn', 'Para  meterValue': role},
             {'ParameterKey': 'LambdaFunction', 'ParameterValue': function},
         ]
     )
@@ -169,20 +156,55 @@ def cloud_formation(bucket, template, function, region, role):
 
 
 def get_available_regions(service):
-    # List available regions for service
+    """List available regions for service."""
     s = boto3.session.Session()
     return s.get_available_regions(service)
 
 
 if __name__ == "__main__":
-    role = create_role()
-    bucket = create_bucket()
-    cloud_trail = enable_cloud_trail(bucket)
+    rolePolicy = {
+      "Version" : "2012-10-17",
+      "Statement" : [
+        {
+          "Sid" : "Stmt1458923097000",
+          "Effect" : "Allow",
+          "Action" : ["cloudtrail:LookupEvents"],
+          "Resource" : ["*"]
+        },
+        {
+          "Sid" : "Stmt1458923121000",
+          "Effect" : "Allow",
+          "Action" : [
+            "ec2:CreateTags",
+            "ec2:Describe*",
+            "logs:CreateLogGroup",
+            "logs:CreateLogStream",
+            "logs:PutLogEvents"
+          ],
+          "Resource" : ["*"]
+        }
+      ]
+    }
+
+    # Create role with inline policy
+    role = create_role(roleName='LambdaAutoTagRole',
+                       policyName='LambdaAutoTagPolicy',
+                       rolePolicy=rolePolicy)
+
+    # Create bucket
+    bucket = create_bucket(name='autotag-resources')
+
+    # Enable cloud trail for all regions
+    cloud_trail = enable_cloud_trail(bucket, 'AutoTagResources')
+
+    # Upload cloud formation template to s3 bucket
     template = upload_file(bucket, 'AutoTag.template')
 
+    # Read lambda function
     with open('autotag.py', 'rb') as f:
         function = f.read()
 
-    for region in ['us-west-1',]:
+    # Deploy cloud formation to all lambda available regions
+    for region in get_available_regions('lamdba'):
         cloud_formation(bucket, template, function, region, role)
 
