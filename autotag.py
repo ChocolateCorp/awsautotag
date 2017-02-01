@@ -22,11 +22,11 @@ def lambda_handler(event, context):
         if userType == 'IAMUser':
             user = detail['userIdentity']['userName']
 
+        elif userType == 'Root':
+            user = principal
+
         else:
-            try:
-                user = principal.split(':')[1]
-            except IndexError:
-                user = principal
+            user = principal.split(':')[-1]
 
 
         logger.info('principalId: ' + str(principal))
