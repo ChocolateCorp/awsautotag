@@ -21,45 +21,20 @@ def get_account_id():
     return boto3.client('sts').get_caller_identity().get('Account')
 
 
-def create_bucket(name):
+def create_bucket(name, policy=None):
     """Create s3 bucket and attach cloudtrail policy."""
     s3 = boto3.client('s3')
-    bucket = '%s-%s' % (name, get_random_string())
 
-    bucketPolicy = {
-      "Version": "2012-10-17",
-      "Statement": [
-        {
-          "Sid": "AWSCloudTrailAclCheck20150319",
-          "Effect": "Allow",
-          "Principal": {"Service": "cloudtrail.amazonaws.com"},
-          "Action": "s3:GetBucketAcl",
-          "Resource": "arn:aws:s3:::%s" % bucket
-        },
-        {
-          "Sid": "AWSCloudTrailWrite20150319",
-          "Effect": "Allow",
-          "Principal": {"Service": "cloudtrail.amazonaws.com"},
-          "Action": "s3:PutObject",
-          "Resource": "arn:aws:s3:::%s/AWSLogs/%s/*" % (bucket,
-                                                        get_account_id()),
-          "Condition": {"StringEquals": {"s3:x-amz-acl":
-              "bucket-owner-full-control"}
-          }
-        }
-      ]
-    }
+    s3.create_bucket(Bucket=bucket)
+    print("S3 bucket %s created." % bucket)
 
-    response = s3.create_bucket(
-        Bucket=bucket
-    )
+    if policy:
+        s3.put_bucket_policy(
+            Bucket=bucket,
+            Policy=json.dumps(bucketPolicy)
+        )
+        print("Policy attached to S3 bucket.")
 
-    response = s3.put_bucket_policy(
-        Bucket=bucket,
-        Policy=json.dumps(bucketPolicy)
-    )
-
-    print("S3 bucket named %s created and policy attached." % bucket)
     return bucket
 
 
@@ -141,7 +116,7 @@ def cloud_formation(bucket, template, function, region, role):
 
     url = 'https://s3.amazonaws.com/{bucket}/{template}'.format(bucket=bucket,
                                                             template=template)
-    response = client.create_stack(
+    client.create_stack(
         StackName='AutoTagResources',
         TemplateURL=url,
         DisableRollback=False,
@@ -191,8 +166,33 @@ if __name__ == "__main__":
                        policyName='LambdaAutoTagPolicy',
                        rolePolicy=rolePolicy)
 
+    bucket = '%s-%s' % ('autotag-resources', get_random_string())
+    bucketPolicy = {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Sid": "AWSCloudTrailAclCheck20150319",
+          "Effect": "Allow",
+          "Principal": {"Service": "cloudtrail.amazonaws.com"},
+          "Action": "s3:GetBucketAcl",
+          "Resource": "arn:aws:s3:::%s" % bucket
+        },
+        {
+          "Sid": "AWSCloudTrailWrite20150319",
+          "Effect": "Allow",
+          "Principal": {"Service": "cloudtrail.amazonaws.com"},
+          "Action": "s3:PutObject",
+          "Resource": "arn:aws:s3:::%s/AWSLogs/%s/*" % (bucket,
+                                                        get_account_id()),
+          "Condition": {"StringEquals": {"s3:x-amz-acl":
+              "bucket-owner-full-control"}
+          }
+        }
+      ]
+    }
+
     # Create bucket
-    bucket = create_bucket(name='autotag-resources')
+    bucket = create_bucket(name=bucket, policy=bucketPolicy)
 
     # Enable cloud trail for all regions
     cloud_trail = enable_cloud_trail(bucket, 'AutoTagResources')
