@@ -56,7 +56,7 @@ def create_bucket(name):
 
     response = s3.put_bucket_policy(
         Bucket=bucket,
-        Policy=json.dumps(policy)
+        Policy=json.dumps(bucketPolicy)
     )
 
     print("S3 bucket named %s created and policy attached." % bucket)
